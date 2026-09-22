@@ -1,0 +1,7 @@
+<configuration>
+  <appender name="console" class="ch.qos.logback.core.ConsoleAppender"><encoder><pattern>%level %logger{36} - %msg%n</pattern></encoder></appender>
+  <logger name="org.hibernate.engine.jdbc.spi.SqlExceptionHelper" level="OFF"/>
+  <logger name="io.debezium" level="OFF"/>
+  <logger name="com.zaxxer.hikari" level="OFF"/>
+  <root level="ERROR"><appender-ref ref="console"/></root>
+</configuration>

@@ -1,5 +1,7 @@
 # TEST deployment and verification
 
+Current deployment: the [2026-09-22 cleanup and employee onboarding](test-cutover.md) supersedes the original capture list below. Business capture now includes `HR_Employee` and `HR_EmployeeContractInfo`; the two probe tables and all 594 synthetic events have been removed. Earlier acceptance results below remain historical evidence.
+
 ## Agreed configuration
 
 - Source tenant: TECHNO; SQL Server 2019 Developer, 192.168.99.133, tdev_technophar.

@@ -14,10 +14,9 @@ cdc:
       password: ${CDC_TECHNO_PASSWORD}
       encrypt: ${CDC_TECHNO_ENCRYPT:true}
       trust-server-certificate: ${CDC_TECHNO_TRUST_CERTIFICATE:false}
-      tables: ${CDC_TECHNO_TABLES:dbo.HR_EmployeeContractInfo}
+      tables: ${CDC_TECHNO_TABLES:dbo.HR_Employee,dbo.HR_EmployeeContractInfo}
       minimum-retention-minutes: 20160
       max-queue-size: 1024
       max-batch-size: 128
 # Add another tenant entry with a unique ID and a different source database.
-# TEST only: CDC_TECHNO_TABLES=dbo.HR_EmployeeContractInfo,dbo.CodexCdcProbe,dbo.CodexCdcProbeOther
 # Fix the table list before first activation. Later additions require a reviewed onboarding plan.
