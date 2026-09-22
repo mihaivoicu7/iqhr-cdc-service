@@ -1,0 +1,7 @@
+target/
+.env
+config/application.yml
+*.log
+.DS_Store
+__pycache__/
+*.pyc

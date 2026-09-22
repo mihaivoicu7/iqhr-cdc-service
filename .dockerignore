@@ -1,0 +1,4 @@
+**
+!target/iqhr-cdc-service-0.1.0.jar
+!config/
+!config/application.example.yml

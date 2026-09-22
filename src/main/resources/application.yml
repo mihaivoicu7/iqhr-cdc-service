@@ -1,0 +1,31 @@
+spring:
+  application:
+    name: iqhr-cdc-service
+  main:
+    banner-mode: "off"
+server:
+  port: 8095
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true
+cdc:
+  tenants: []
+  monitor-interval: 30s
+  retry-delay: 10s
+  history-retention-days: 365
+  retention-batch-size: 500
+# Connect/engine diagnostics can embed event values or connection configuration.
+# Our own diagnostics expose fixed codes and exception class names only.
+logging:
+  level:
+    io.debezium: OFF
+    org.apache.kafka: OFF
+    org.hibernate.engine.jdbc.spi.SqlExceptionHelper: OFF
+    com.zaxxer.hikari: OFF

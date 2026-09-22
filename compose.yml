@@ -1,0 +1,28 @@
+services:
+  iqhr-cdc-service:
+    image: iqhr/iqhr-cdc-service:${CDC_IMAGE_TAG:-0.1.0}
+    build: .
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 1.0
+    stop_grace_period: 90s
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    environment:
+      CDC_BROKER_URL: ${CDC_BROKER_URL:-tcp://message-broker:61616}
+      CDC_BROKER_USER: ${CDC_BROKER_USER:?required}
+      CDC_BROKER_PASSWORD: ${CDC_BROKER_PASSWORD:?required}
+      CDC_TECHNO_USER: ${CDC_TECHNO_USER:?required}
+      CDC_TECHNO_PASSWORD: ${CDC_TECHNO_PASSWORD:?required}
+      CDC_TECHNO_HOST: ${CDC_TECHNO_HOST:-192.168.99.133}
+      CDC_TECHNO_DATABASE: ${CDC_TECHNO_DATABASE:-tdev_technophar}
+      CDC_TECHNO_ENCRYPT: ${CDC_TECHNO_ENCRYPT:-true}
+      CDC_TECHNO_TRUST_CERTIFICATE: ${CDC_TECHNO_TRUST_CERTIFICATE:-false}
+      CDC_TECHNO_TABLES: ${CDC_TECHNO_TABLES:-dbo.HR_EmployeeContractInfo}
+    networks:
+      - iqhr
+networks:
+  iqhr:
+    external: true
+    name: ${CDC_DOCKER_NETWORK:-iqhr}

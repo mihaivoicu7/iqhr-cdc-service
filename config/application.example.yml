@@ -1,0 +1,23 @@
+cdc:
+  broker:
+    url: ${CDC_BROKER_URL:tcp://message-broker:61616}
+    user: ${CDC_BROKER_USER}
+    password: ${CDC_BROKER_PASSWORD}
+  tenants:
+    - id: TECHNO
+      source-id: employee-contract-info
+      enabled: true
+      host: ${CDC_TECHNO_HOST:192.168.99.133}
+      port: ${CDC_TECHNO_PORT:1433}
+      database: ${CDC_TECHNO_DATABASE:tdev_technophar}
+      user: ${CDC_TECHNO_USER}
+      password: ${CDC_TECHNO_PASSWORD}
+      encrypt: ${CDC_TECHNO_ENCRYPT:true}
+      trust-server-certificate: ${CDC_TECHNO_TRUST_CERTIFICATE:false}
+      tables: ${CDC_TECHNO_TABLES:dbo.HR_EmployeeContractInfo}
+      minimum-retention-minutes: 20160
+      max-queue-size: 1024
+      max-batch-size: 128
+# Add another tenant entry with a unique ID and a different source database.
+# TEST only: CDC_TECHNO_TABLES=dbo.HR_EmployeeContractInfo,dbo.CodexCdcProbe,dbo.CodexCdcProbeOther
+# Fix the table list before first activation. Later additions require a reviewed onboarding plan.
