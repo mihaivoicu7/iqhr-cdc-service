@@ -1,6 +1,6 @@
 # TEST deployment and verification
 
-Current deployment: the [2026-09-22 cleanup and employee onboarding](test-cutover.md) supersedes the original capture list below. Business capture now includes `HR_Employee` and `HR_EmployeeContractInfo`; the two probe tables and all 594 synthetic events have been removed. Earlier acceptance results below remain historical evidence.
+Current configuration: the [2026-09-22 cleanup and employee onboarding](test-cutover.md), followed by [address/allocation onboarding](adding-tables.md), supersedes the original capture list below. The four business tables are `HR_Employee`, `HR_EmployeeContractInfo`, `HR_EmployeeAllocation` and `HR_EmployeeAddress`; the two probe tables and all 594 synthetic events have been removed. Earlier acceptance results below remain historical evidence.
 
 ## Agreed configuration
 
@@ -72,3 +72,5 @@ Recovery depends on intact SQL Server CDC retention, durable broker data, and te
 - Service SQL Server control: database-specific CDC metadata, LSN validation, SQL Agent/space monitoring and a database-scoped session lock. Retained because mapped entity lifecycle operations cannot provide these SQL Server CDC/control contracts.
 - Debezium JDBC offset/schema storage: retained standard connector storage protocol with fenced writes. History/status/activation/retention use JPA. Guarded schema DDL belongs to Flyway; operational TEST provisioning is separate.
 - Admin viewer: new history/status reads use tenant-routed JPA. Existing BundleJdbcService membership/module/permission reads are reused and remain parameterized JDBC. A bounded future JPA conversion would map tenants,tenant_modules,user_tenant_permissions,user_tenant_module_permissions in the master persistence unit and preserve ID-or-username matching and administrator inheritance. The tenant connection bootstrap lookup remains JDBC because it is required before constructing tenant persistence access.
+
+The subsequent durable table-management rollout, real stopped-service Enable flow, forced-restart check and collapsible Admin status panel are recorded in [table onboarding evidence](adding-tables.md#durable-registry-rollout-evidence-2026-09-22).

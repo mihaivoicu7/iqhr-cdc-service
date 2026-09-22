@@ -63,9 +63,14 @@ public class TenantStore implements AutoCloseable {
     public boolean hasSchemaHistory() { return transaction(em -> !em.createQuery("select e.sequence from SchemaHistoryRow e",Long.class).setMaxResults(1).getResultList().isEmpty()); }
     public List<OffsetRow> offsets() { return transaction(em -> em.createQuery("from OffsetRow",OffsetRow.class).getResultList()); }
     public SourceActivation claim() {
+        return claim(tenant);
+    }
+    public SourceActivation claim(Tenant effectiveTenant) {
+        if(!tenant.id().equals(effectiveTenant.id())||!tenant.sourceId().equals(effectiveTenant.sourceId()))
+            throw new ContinuityException("SOURCE_IDENTITY_CHANGED");
         return transaction(em -> {
             SourceActivation row=em.find(SourceActivation.class,tenant.sourceId(),LockModeType.PESSIMISTIC_WRITE);
-            String hash=configurationHash(tenant);
+            String hash=configurationHash(effectiveTenant);
             if(row==null) {
                 row=new SourceActivation(); row.sourceId=tenant.sourceId(); row.tenantId=tenant.id();
                 row.incarnation=UUID.randomUUID().toString(); row.configurationHash=hash; row.createdAt=Instant.now(); row.fence=1;
@@ -75,6 +80,11 @@ public class TenantStore implements AutoCloseable {
                     throw new ContinuityException("SOURCE_CONFIGURATION_CHANGED");
                 row.fence++;
             }
+            // Fresh tenants initialize the registry before claiming their first activation.
+            // Commit its existence marker with that activation, without a crash window between writes.
+            if(!em.createQuery("select t.tableId from CdcTable t where t.tenantId=:tenant and t.sourceId=:source",String.class)
+                    .setParameter("tenant",tenant.id()).setParameter("source",tenant.sourceId()).setMaxResults(1).getResultList().isEmpty())
+                row.tableRegistryInitialized=true;
             return row;
         });
     }
@@ -113,15 +123,15 @@ public class TenantStore implements AutoCloseable {
             rows.forEach(em::remove); return rows.size();
         });
     }
-    public void tickHeartbeat(long fence) {
-        transaction(em -> {
+    public long tickHeartbeat(long fence) {
+        return transaction(em -> {
             assertFence(em,fence);
             SourceHeartbeat row=em.find(SourceHeartbeat.class,1,LockModeType.PESSIMISTIC_WRITE);
             boolean fresh=row==null;
             if(fresh) {row=new SourceHeartbeat();row.singletonId=1;}
             row.tickSequence++;row.tickedAt=Instant.now();
             if(fresh)em.persist(row);
-            return null;
+            return row.tickSequence;
         });
     }
     public static String sha256(String value) {

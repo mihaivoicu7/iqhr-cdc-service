@@ -14,8 +14,13 @@ public final class EventCodec {
     private final ObjectMapper mapper;
     private final Tenant tenant;
     private final String incarnation;
+    private final Map<String,String> activationLsns;
     public EventCodec(ObjectMapper mapper,Tenant tenant,String incarnation) {
+        this(mapper,tenant,incarnation,Map.of());
+    }
+    public EventCodec(ObjectMapper mapper,Tenant tenant,String incarnation,Map<String,String> activationLsns) {
         this.mapper=mapper; this.tenant=tenant; this.incarnation=incarnation;
+        this.activationLsns=Map.copyOf(activationLsns);
     }
     public HistoryEvent parse(String keyJson,String valueJson,String destination) {
         if(valueJson==null)return null; // Kafka tombstone after an already-emitted DELETE.
@@ -42,6 +47,9 @@ public final class EventCodec {
                     || !("INSERT".equals(operation)||"UPDATE".equals(operation)))throw new ContinuityException("INVALID_INTERNAL_HEARTBEAT");
             return null; // Ordered engine acknowledgement advances a real committed source position only.
         }
+        String activation=activationLsns.get(schema+"."+table);
+        if(activation!=null&&Arrays.compareUnsigned(SqlServerControl.parseLsn(event.commitLsn),SqlServerControl.parseLsn(activation))<=0)
+            return null; // User enablement starts strictly after the durable cutover commit, without backfill.
         event.eventSerialNo=source.path("event_serial_no").longValue();
         event.occurredAt=Instant.ofEpochMilli(source.path("ts_ms").longValue()); event.capturedAt=Instant.now();
         JsonNode before=value.get("before"),after=value.get("after");

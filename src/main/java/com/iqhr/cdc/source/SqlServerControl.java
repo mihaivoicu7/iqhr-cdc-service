@@ -2,6 +2,7 @@ package com.iqhr.cdc.source;
 
 import com.iqhr.cdc.CdcProperties.Tenant;
 import com.iqhr.cdc.store.ContinuityException;
+import com.iqhr.cdc.store.TenantStore;
 import java.sql.*;
 import java.time.*;
 import java.util.*;
@@ -34,6 +35,9 @@ public final class SqlServerControl implements AutoCloseable {
         } catch(SQLException e) { throw new ContinuityException("SOURCE_LOCK_UNAVAILABLE"); }
     }
     public synchronized Diagnostics inspect(String savedCommitLsn) throws SQLException {
+        return inspect(savedCommitLsn,tenant.capturedTables());
+    }
+    public synchronized Diagnostics inspect(String savedCommitLsn,Collection<String> capturedTables) throws SQLException {
         assertOwnership();
         Integer retention=null;
         try(PreparedStatement statement=query("EXEC sys.sp_cdc_help_jobs"); ResultSet result=statement.executeQuery()) {
@@ -46,7 +50,7 @@ public final class SqlServerControl implements AutoCloseable {
         } catch(SQLException e) { jobStateUnavailable=true; }
         long headroom=retention.longValue()*60;
         byte[] saved=savedCommitLsn==null?null:parseLsn(savedCommitLsn);
-        for(String table:tenant.capturedTables()) {
+        for(String table:capturedTables) {
             boolean found=false,covered=saved==null;
             try(PreparedStatement statement=query("SELECT capture_instance,end_lsn FROM cdc.change_tables WHERE source_object_id=OBJECT_ID(?)")) {
                 statement.setString(1,table);
@@ -95,6 +99,108 @@ public final class SqlServerControl implements AutoCloseable {
                 freeBytes<2L*1024*1024*1024||cappedFreePages<131072?"SOURCE_STORAGE_LOW":
                 headroom<7L*86400?"CDC_RETENTION_HEADROOM_LOW":jobStateUnavailable?"CDC_JOB_STATE_METRICS_UNAVAILABLE":volumeUnavailable?"PHYSICAL_DISK_METRICS_UNAVAILABLE":null;
         return new Diagnostics(retention,headroom,warning);
+    }
+    /** SQL Server-owned catalog metadata cannot be represented by application table entities. */
+    public synchronized List<TableObservation> observeTables() throws SQLException {
+        assertOwnership();
+        Map<String,List<CaptureObservation>> grouped=new TreeMap<>();
+        Map<String,String> names=new HashMap<>();
+        try(PreparedStatement statement=query("SELECT s.name,t.name,ct.capture_instance,ct.object_id,ct.source_object_id,ct.create_date,ct.start_lsn FROM cdc.change_tables ct JOIN sys.tables t ON t.object_id=ct.source_object_id JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE t.is_ms_shipped=0");ResultSet rows=statement.executeQuery()) {
+            while(rows.next()) {
+                String schema=rows.getString(1),table=rows.getString(2);
+                if(table.toLowerCase(Locale.ROOT).contains("iqhr_cdc")||"cdc".equalsIgnoreCase(schema))continue;
+                String name=schema+"."+table;
+                int captureId=rows.getInt(4),sourceId=rows.getInt(5);
+                String descriptor=sourceId+"|"+captureId+"|"+rows.getString(3)+"|"+rows.getTimestamp(6).toLocalDateTime()
+                        +"|"+columnShape(sourceId)+"|"+columnShape(captureId)+"|"+keyShape(sourceId);
+                boolean keyed=hasCapturedKey(sourceId,captureId);
+                byte[] minimum=rows.getBytes(7);
+                grouped.computeIfAbsent(name,ignored -> new ArrayList<>()).add(new CaptureObservation(rows.getString(3),descriptor,minimum,keyed));
+                names.put(name,schema);
+            }
+        }
+        List<TableObservation> result=new ArrayList<>();
+        for(var item:grouped.entrySet()) {
+            String name=item.getKey(),schema=names.get(name),table=name.substring(schema.length()+1);
+            List<CaptureObservation> captures=item.getValue();
+            boolean supported=name.matches("[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*");
+            boolean ready=captures.stream().allMatch(c -> validMinimum(c.minimum()));
+            boolean keyed=captures.stream().allMatch(CaptureObservation::keyed);
+            String fingerprint=TenantStore.sha256(String.join("\n",captures.stream().map(CaptureObservation::descriptor).sorted().toList()));
+            result.add(new TableObservation(schema,table,fingerprint,supported&&ready&&keyed,
+                    !supported?"TABLE_IDENTIFIER_UNSUPPORTED":!keyed?"CAPTURED_PRIMARY_KEY_REQUIRED":!ready?"CDC_CAPTURE_INITIALIZING":null,
+                    captures.stream().map(CaptureObservation::minimum).filter(Objects::nonNull).toList()));
+        }
+        return List.copyOf(result);
+    }
+    private String columnShape(int objectId) throws SQLException {
+        StringBuilder shape=new StringBuilder();
+        try(PreparedStatement statement=query("SELECT column_id,name,system_type_id,user_type_id,max_length,precision,scale,is_nullable FROM sys.columns WHERE object_id=? ORDER BY column_id")) {
+            statement.setInt(1,objectId);
+            try(ResultSet rows=statement.executeQuery()) {while(rows.next())for(int column=1;column<=8;column++)shape.append(rows.getString(column)).append('|');}
+        }
+        return shape.toString();
+    }
+    private boolean hasCapturedKey(int sourceId,int captureId) throws SQLException {
+        try(PreparedStatement statement=query("SELECT COUNT(*),SUM(CASE WHEN cc.column_name IS NULL THEN 1 ELSE 0 END) FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id=i.object_id AND ic.index_id=i.index_id AND ic.key_ordinal>0 JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id LEFT JOIN cdc.captured_columns cc ON cc.object_id=? AND cc.column_name=c.name WHERE i.object_id=? AND i.is_primary_key=1")) {
+            statement.setInt(1,captureId);statement.setInt(2,sourceId);
+            try(ResultSet rows=statement.executeQuery()) {return rows.next()&&rows.getInt(1)>0&&rows.getInt(2)==0;}
+        }
+    }
+    private String keyShape(int sourceId) throws SQLException {
+        StringBuilder shape=new StringBuilder();
+        try(PreparedStatement statement=query("SELECT ic.key_ordinal,c.name FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id=i.object_id AND ic.index_id=i.index_id JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id WHERE i.object_id=? AND i.is_primary_key=1 AND ic.key_ordinal>0 ORDER BY ic.key_ordinal")) {
+            statement.setInt(1,sourceId);
+            try(ResultSet rows=statement.executeQuery()) {while(rows.next())shape.append(rows.getInt(1)).append(':').append(rows.getString(2)).append('|');}
+        }
+        return shape.toString();
+    }
+    /** A captured internal tick proves all source commits before this service-side activation request were scanned. */
+    public synchronized String onboardingBoundary(long heartbeatTick) throws SQLException {
+        assertOwnership();
+        try(PreparedStatement statement=query("SELECT TOP(1) [__$start_lsn],sys.fn_cdc_get_max_lsn() FROM cdc.dbo_IQHR_CdcHeartbeat_CT WHERE singleton_id=1 AND tick_sequence=? AND [__$operation] IN (2,4) ORDER BY [__$start_lsn] DESC")) {
+            statement.setLong(1,heartbeatTick);
+            try(ResultSet rows=statement.executeQuery()) {
+                if(!rows.next())return null;
+                byte[] barrier=rows.getBytes(1),maximum=rows.getBytes(2);
+                if(!validMinimum(barrier)||!validMinimum(maximum)||compare(maximum,barrier)<0)return null;
+                String hex=HexFormat.of().formatHex(maximum);
+                return hex.substring(0,8)+":"+hex.substring(8,16)+":"+hex.substring(16);
+            }
+        }
+    }
+    /** Expansion must not change the connector's skip counter at its exact saved position. */
+    public synchronized boolean boundaryHasNoNewRows(Collection<String> tables,String commitLsn,String changeLsn) throws SQLException {
+        assertOwnership();
+        if("NULL".equals(changeLsn))return true;
+        for(String table:tables) {
+            try(PreparedStatement captures=query("SELECT capture_instance FROM cdc.change_tables WHERE source_object_id=OBJECT_ID(?)")) {
+                captures.setString(1,table);
+                try(ResultSet instances=captures.executeQuery()) {
+                    boolean found=false;
+                    while(instances.next()) {
+                        found=true;
+                        // Identifier comes from SQL Server's CDC catalog, quoted as one identifier; all values are bound.
+                        String changeTable="["+(instances.getString(1)+"_CT").replace("]","]]")+"]";
+                        try(PreparedStatement statement=query("SELECT TOP(1) 1 FROM cdc."+changeTable+" WHERE [__$start_lsn]=? AND [__$seqval]=?")) {
+                            statement.setBytes(1,parseLsn(commitLsn));statement.setBytes(2,parseLsn(changeLsn));
+                            try(ResultSet rows=statement.executeQuery()) {if(rows.next())return false;}
+                        }
+                    }
+                    if(!found)return false;
+                }
+            }
+        }
+        return true;
+    }
+    private static boolean validMinimum(byte[] value) {return value!=null&&value.length==10&&!Arrays.equals(value,new byte[10]);}
+    private record CaptureObservation(String name,String descriptor,byte[] minimum,boolean keyed) {}
+    public record TableObservation(String schema,String table,String fingerprint,boolean eligible,String diagnostic,List<byte[]> minimums) {
+        public String qualifiedName() {return schema+"."+table;}
+        public boolean coversStart(String saved) {
+            byte[] lsn=parseLsn(saved);
+            return eligible&&minimums.stream().anyMatch(min -> validMinimum(min)&&compare(lsn,min)>=0);
+        }
     }
     public static byte[] parseLsn(String lsn) {
         if(lsn==null||!lsn.matches("[0-9a-fA-F]{8}:[0-9a-fA-F]{8}:[0-9a-fA-F]{4}"))throw new ContinuityException("INVALID_SOURCE_POSITION");

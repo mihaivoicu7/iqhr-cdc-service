@@ -11,4 +11,5 @@ public class SourceActivation {
     @Column(name="configuration_hash", nullable=false, length=64) public String configurationHash;
     @Column(name="created_at", nullable=false) public Instant createdAt;
     @Column(name="fence", nullable=false) public long fence;
+    @Column(name="table_registry_initialized",nullable=false) public boolean tableRegistryInitialized;
 }

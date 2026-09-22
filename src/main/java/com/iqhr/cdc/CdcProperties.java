@@ -70,6 +70,10 @@ public record CdcProperties(Broker broker, List<Tenant> tenants, Duration monito
         }
         public String queue() { return address() + ".history"; }
         public String connectorName() { return "iqhr-cdc-" + id + "-" + sourceId; }
+        public Tenant withTables(List<String> effectiveTables) {
+            return new Tenant(id,sourceId,host,port,database,user,password,encrypt,trustServerCertificate,
+                    effectiveTables,enabled,minimumRetentionMinutes,maxQueueSize,maxBatchSize);
+        }
         @Override public String toString() { return "Tenant[id=" + id + ", sourceId=" + sourceId + "]"; }
     }
 }

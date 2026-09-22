@@ -19,7 +19,7 @@ services:
       CDC_TECHNO_DATABASE: ${CDC_TECHNO_DATABASE:-tdev_technophar}
       CDC_TECHNO_ENCRYPT: ${CDC_TECHNO_ENCRYPT:-true}
       CDC_TECHNO_TRUST_CERTIFICATE: ${CDC_TECHNO_TRUST_CERTIFICATE:-false}
-      CDC_TECHNO_TABLES: ${CDC_TECHNO_TABLES:-dbo.HR_EmployeeContractInfo}
+      CDC_TECHNO_TABLES: ${CDC_TECHNO_TABLES:-dbo.HR_Employee,dbo.HR_EmployeeContractInfo,dbo.HR_EmployeeAllocation,dbo.HR_EmployeeAddress}
     networks:
       - iqhr
 networks:

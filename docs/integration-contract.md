@@ -4,7 +4,7 @@ Agreed scope: one separately deployable multi-tenant service, initially TECHNO /
 
 ## Ownership
 
-The CDC service owns its SQL Server schema migrations and all history/status writes. Admin reads history with tenant-routed JPA and exposes authorization-protected endpoints. No cross-service HTTP data call is required. One shared service runs independent configured tenant readers/consumers. Artemis provides one durable multicast address per tenant, allowing independent subscribers later.
+The CDC service owns its SQL Server schema migrations, history/status writes and table-discovery/onboarding transitions. Admin reads with tenant-routed JPA and may record a table enable request after CDC ADMIN authorization. It does not enable SQL Server CDC, mutate checkpoints or create storage. No cross-service HTTP data call is required. One shared service runs independent configured tenant readers/consumers. Artemis provides one durable multicast address per tenant, allowing independent subscribers later.
 
 ## Tenant tables (explicit column names)
 
@@ -21,8 +21,14 @@ All under `/api/cdc`, requiring selected tenant and `assertModulePermission(tena
 - `GET /events/{id}`: summary plus `{before: object|null, after: object|null}`. Unknown/cross-tenant event is 404.
 - `GET /filter-values?field=table&query=&page=0&size=30`: `{items: ["dbo.HR_EmployeeContractInfo"], hasNext}` matching incumbent FilterValuesResponseDto.
 - `GET /status`: array of `{sourceId, state, message, updatedAt, lastEventAt, lastCommitLsn, retentionMinutes, retentionHeadroomSeconds}`.
+- `GET /tables?page=0&size=20&query=&state=`: paginated SQL CDC inventory with `{content,page,size,totalElements,canManage}`. Rows expose `{id,sourceId,schemaName,tableName,sqlCdcEnabled,desiredEnabled,active,state,diagnostic,observedAt,requestedAt,enabledAt,activationLsn,canEnable}`. Reads require CDC VIEW; management capability requires CDC ADMIN. DISCOVERED/PENDING/ONBOARDING/ACTIVE/BLOCKED/MISSING distinguish discovery from actual collection. Observations older than two minutes cannot authorize a new request.
+- `POST /tables/{id}/enable`: no body or query parameters; requires CDC ADMIN. A tenant-scoped pessimistic JPA lock records only `desired_enabled`, `state=PENDING`, `requested_at`, `requested_by` and the optimistic version. Repeat requests return the existing state without retrying blocked onboarding. Foreign IDs return 404; stale/ineligible/concurrent requests return 409; unavailable storage returns sanitized 503.
 
 Use existing EntityCrudPage/FilterBar, read-only controls, tenant-keyed route `/cdc`. Table/action/date/record-key filters and before/after detail comparison. Changed-only toggle and field-name search in detail; distinguish absent, null, empty string, zero and false. Show all real operations including trigger-generated records. No invented actor identity: CDC alone does not identify the application user.
+
+The menu groups **Istoric modificări CDC** and **Tabele CDC** under **CDC**. `/cdc/tables` uses shared table/filter/pagination controls with cancellable inventory requests. It explicitly explains that enabling a table starts capture strictly after its persisted activation commit and does not import earlier SQL CDC history.
+
+`dbo.IQHR_CdcTable` is service-provisioned registry storage. Identity is SHA-256 of tenant, source, schema and table separated by newlines. It stores the fixed source/tenant/name fields; SQL-enabled and desired/active flags; capture-generation fingerprint; state/diagnostic; observation, request and enable timestamps; request actor; activation LSN; and an optimistic version. A unique tenant/source/schema/table constraint prevents duplicate registrations. Service transactions reload/lock rows so observation updates cannot overwrite concurrent Admin requests. Existing configured tables bootstrap without a new source incarnation or checkpoint reset. Subsequent active-table membership is durable registry state, not an environment-list edit.
 
 ## Recovery requirements
 
@@ -30,4 +36,4 @@ Persist schema/offset state in the tenant DB. Publish persistent messages with a
 
 ## Verification
 
-Unit/integration coverage for duplicate replay, failures at publish/commit/ack boundaries, tenant isolation, permission/module gates, inserts/updates/deletes, exact filters and stable pagination, typed before/after comparisons. Live synthetic CDC probe tables/rows may be created on TEST for insert/update/delete/restart testing; never mutate real employee rows for testing, drop existing objects, or auto-enable additional business tables. Verify deployed UI in browser. Report test evidence and remaining limitations honestly.
+Unit/integration coverage for duplicate replay, failures at publish/commit/ack boundaries, tenant isolation, permission/module gates, inserts/updates/deletes, exact filters and stable pagination, typed before/after comparisons, durable onboarding, request races and capture replacement. Use existing isolated tests by default; source business-data mutations require explicit user authorization and exact restoration. The user authorized controlled HR Manager changes during the 2026-09-22 investigation. Do not auto-enable additional business tables. Verify deployed UI in browser and report test evidence and remaining limitations honestly.

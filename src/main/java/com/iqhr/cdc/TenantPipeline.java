@@ -8,6 +8,7 @@ import com.iqhr.cdc.store.*;
 import io.debezium.engine.*;
 import io.debezium.engine.format.Json;
 import java.time.*;
+import java.util.*;
 import java.util.concurrent.atomic.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,7 +17,8 @@ import org.slf4j.LoggerFactory;
 public final class TenantPipeline implements AutoCloseable {
     private static final Logger LOG=LoggerFactory.getLogger(TenantPipeline.class);
     private final CdcProperties settings;
-    private final CdcProperties.Tenant tenant;
+    private final CdcProperties.Tenant configuredTenant;
+    private volatile CdcProperties.Tenant tenant;
     private final ObjectMapper mapper;
     private final AtomicBoolean running=new AtomicBoolean(true);
     private volatile String state="STARTING", diagnostic="INITIALIZING";
@@ -24,7 +26,7 @@ public final class TenantPipeline implements AutoCloseable {
     private volatile Thread worker;
     private volatile DebeziumEngine<ChangeEvent<String,String>> engine;
     public TenantPipeline(CdcProperties settings,CdcProperties.Tenant tenant,ObjectMapper mapper) {
-        this.settings=settings; this.tenant=tenant; this.mapper=mapper;
+        this.settings=settings; this.configuredTenant=tenant; this.tenant=tenant; this.mapper=mapper;
     }
     public void start() { worker=Thread.ofVirtual().name("cdc-tenant-"+tenant.id()).start(this::supervise); }
     private void supervise() {
@@ -40,19 +42,37 @@ public final class TenantPipeline implements AutoCloseable {
     }
     private void runOnce() throws Exception {
         // Acquire the SQL Server session lock before migrations or activation writes.
-        try(SqlServerControl control=new SqlServerControl(tenant); TenantStore store=TenantStore.open(tenant);
-            DurableBroker broker=new DurableBroker(settings.broker(),tenant)) {
-            SourceActivation previous=store.activation();
+        try(SqlServerControl control=new SqlServerControl(configuredTenant); TenantStore store=TenantStore.open(configuredTenant);
+            DurableBroker broker=new DurableBroker(settings.broker(),configuredTenant)) {
             long fence=0;
             try {
+                TableRegistry registry=new TableRegistry(store,configuredTenant);
+                List<SqlServerControl.TableObservation> observed=control.observeTables();
+                registry.initialize(observed);
+                tenant=registry.effectiveTenant();
+                SourceActivation previous=store.activation();
                 String savedLsn=RecoveryGuard.savedLsn(previous,store.offsets(),tenant,mapper);
                 if(previous!=null&&!store.hasSchemaHistory())throw new ContinuityException("SCHEMA_HISTORY_MISSING");
                 if(previous==null&&(store.hasHistory()||store.hasSchemaHistory()))throw new ContinuityException("ACTIVATION_STATE_INCONSISTENT");
-                SqlServerControl.Diagnostics initial=control.inspect(savedLsn);
+                registry.observe(observed,savedLsn,0);registry.assertActiveContinuity();
+                // A stopped-reader request is enrolled at its existing checkpoint before any engine can advance it.
+                if(previous!=null&&tryOnboard(store,control,registry,observed,previous.fence)) {
+                    tenant=registry.effectiveTenant();previous=store.activation();
+                    savedLsn=RecoveryGuard.savedLsn(previous,store.offsets(),tenant,mapper);
+                }
+                SqlServerControl.Diagnostics initial=control.inspect(savedLsn,tenant.capturedTables());
                 if(initial.retentionMinutes()<tenant.minimumRetentionMinutes())throw new ContinuityException("CDC_RETENTION_BELOW_14_DAYS");
                 broker.verifyQueue(); // MUST precede the first activation and engine start.
-                SourceActivation activation=store.claim(); fence=activation.fence;
-                captureAndConsume(store,control,broker,activation,previous==null);
+                SourceActivation activation=store.claim(tenant); fence=activation.fence;
+                registry.starting(fence);
+                boolean requested=captureAndConsume(store,control,broker,activation,previous==null,registry);
+                if(requested) {
+                    // captureAndConsume has joined both workers and flushed confirmed offsets before returning.
+                    observed=control.observeTables();
+                    savedLsn=RecoveryGuard.savedLsn(activation,store.offsets(),tenant,mapper);
+                    registry.observe(observed,savedLsn,fence);registry.assertActiveContinuity();
+                    tryOnboard(store,control,registry,observed,fence);
+                }
             } catch(Exception e) {
                 state="ERROR"; diagnostic=code(e); updatedAt=Instant.now();
                 // Never overwrite another live owner's status before having acquired the session lock.
@@ -61,13 +81,41 @@ public final class TenantPipeline implements AutoCloseable {
             }
         }
     }
-    private void captureAndConsume(TenantStore store,SqlServerControl control,DurableBroker broker,SourceActivation activation,boolean firstActivation) throws Exception {
-        EventCodec codec=new EventCodec(mapper,tenant,activation.incarnation);
+    boolean tryOnboard(TenantStore store,SqlServerControl control,TableRegistry registry,
+                               List<SqlServerControl.TableObservation> observed,long fence) throws Exception {
+        SourceActivation activation=store.activation();
+        List<OffsetRow> offsets=store.offsets();
+        String saved=RecoveryGuard.savedLsn(activation,offsets,tenant,mapper);
+        List<String> requested=registry.readyRequests(observed,saved);
+        if(requested.isEmpty())return false;
+        var offset=mapper.readTree(offsets.getFirst().value);
+        if(offset.has("snapshot")||offset.has("snapshot_completed"))return false;
+        List<String> expanded=new ArrayList<>(tenant.tables());expanded.addAll(requested);
+        control.inspect(saved,tenant.withTables(expanded).capturedTables());
+        if(!control.boundaryHasNoNewRows(requested,saved,offset.path("change_lsn").asText()))return false;
+        // fn_cdc_get_max_lsn alone may lag pre-request commits. Wait for our post-request internal tick.
+        long tick=store.tickHeartbeat(fence);
+        long deadline=System.nanoTime()+Duration.ofSeconds(30).toNanos();String boundary=null;
+        while(running.get()&&System.nanoTime()<deadline&&(boundary=control.onboardingBoundary(tick))==null)Thread.sleep(500);
+        if(boundary==null)return false;
+        control.inspect(boundary,tenant.withTables(expanded).capturedTables());
+        // Recheck generations after the barrier wait; a concurrent DDL/capture replacement must block enrollment.
+        List<SqlServerControl.TableObservation> latest=control.observeTables();
+        registry.observe(latest,saved,fence);registry.assertActiveContinuity();
+        if(!registry.readyRequests(latest,saved).containsAll(requested))return false;
+        control.assertOwnership();
+        return registry.onboard(requested,tenant,offsets.getFirst(),fence,boundary);
+    }
+    private boolean captureAndConsume(TenantStore store,SqlServerControl control,DurableBroker broker,SourceActivation activation,
+                                      boolean firstActivation,TableRegistry registry) throws Exception {
+        EventCodec codec=new EventCodec(mapper,tenant,activation.incarnation,registry.activationBoundaries());
         AtomicBoolean cycle=new AtomicBoolean(true), completed=new AtomicBoolean(false);
         AtomicReference<String> engineFailure=new AtomicReference<>(), consumerFailure=new AtomicReference<>();
         AtomicReference<HistoryEvent> lastEvent=new AtomicReference<>();
         AtomicReference<Instant> progress=new AtomicReference<>(Instant.now());
         Instant initializingSince=Instant.now();
+        String startingOffset=store.offsets().isEmpty()?null:store.offsets().getFirst().value;
+        boolean reconfigure=false;
         try(DurableBroker.Consumer consumer=broker.consumer(); DurableBroker.Publisher publisher=broker.publisher()) {
             ConfirmedChangeConsumer changes=new ConfirmedChangeConsumer(codec,publisher::publish,
                     () -> { control.assertOwnership(); progress.set(Instant.now()); }, lastEvent::set);
@@ -111,7 +159,11 @@ public final class TenantPipeline implements AutoCloseable {
                         }
                         throw e;
                     }
-                    SqlServerControl.Diagnostics info=control.inspect(savedLsn);
+                    List<SqlServerControl.TableObservation> observed=control.observeTables();
+                    registry.observe(observed,savedLsn,activation.fence);registry.assertActiveContinuity();
+                    SqlServerControl.Diagnostics info=control.inspect(savedLsn,tenant.capturedTables());
+                    String currentOffset=store.offsets().getFirst().value;
+                    if(offsetAdvanced(startingOffset,currentOffset))registry.confirmedProgress(activation.fence,savedLsn);
                     long queued=broker.verifyQueue();
                     String warning=info.warning();
                     if(Duration.between(progress.get(),Instant.now()).compareTo(Duration.ofMinutes(2))>0)warning="CAPTURE_PROGRESS_STALE";
@@ -121,8 +173,9 @@ public final class TenantPipeline implements AutoCloseable {
                     diagnostic=failure!=null?"CONSUMER_"+failure:warning!=null?warning:"CAPTURE_AND_CONSUMER_RUNNING";
                     writeStatus(store,activation.fence,warning==null?"RUNNING":"DEGRADED",failure==null?"RUNNING":"ERROR",lastEvent.get(),savedLsn,info);
                     store.prune(Instant.now().minus(Duration.ofDays(settings.historyRetentionDays())),settings.retentionBatchSize(),activation.fence);
+                    if(!registry.readyRequests(observed,savedLsn).isEmpty()) {reconfigure=true;break;}
                 }
-                if(running.get())throw new ContinuityException(engineFailure.get()!=null?engineFailure.get():"PIPELINE_STOPPED_UNEXPECTEDLY");
+                if(running.get()&&!reconfigure)throw new ContinuityException(engineFailure.get()!=null?engineFailure.get():"PIPELINE_STOPPED_UNEXPECTEDLY");
             } finally {
                 cycle.set(false);
                 try { engine.close(); } // Flushes only records confirmed by the ChangeConsumer.
@@ -138,6 +191,20 @@ public final class TenantPipeline implements AutoCloseable {
                 if(!running.get()) { state="STOPPED";diagnostic="SERVICE_STOPPED";writeStatus(store,activation.fence,"STOPPED","STOPPED",lastEvent.get(),null,null); }
             }
         }
+        return reconfigure;
+    }
+    boolean offsetAdvanced(String previous,String current) {
+        if(previous==null)return current!=null;
+        try {
+            var before=mapper.readTree(previous);var after=mapper.readTree(current);
+            int commit=Arrays.compareUnsigned(SqlServerControl.parseLsn(after.path("commit_lsn").asText()),SqlServerControl.parseLsn(before.path("commit_lsn").asText()));
+            if(commit!=0)return commit>0;
+            String first=before.path("change_lsn").asText(),second=after.path("change_lsn").asText();
+            if("NULL".equals(first))return !"NULL".equals(second);
+            if("NULL".equals(second))return false;
+            int change=Arrays.compareUnsigned(SqlServerControl.parseLsn(second),SqlServerControl.parseLsn(first));
+            return change>0||(change==0&&after.path("event_serial_no").asLong()>before.path("event_serial_no").asLong());
+        } catch(Exception error) {return false;}
     }
     private void writeStatus(TenantStore store,long fence,String capture,String consumer,HistoryEvent event,String savedLsn,SqlServerControl.Diagnostics info) {
         updatedAt=Instant.now();

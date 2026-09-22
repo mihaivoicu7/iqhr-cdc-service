@@ -8,6 +8,14 @@ import com.iqhr.cdc.model.*;
 import java.util.*;
 
 class RecoveryGuardTest {
+    @Test void engineReadinessNeedsActualDurableCoordinateProgress() {
+        var pipeline=new TenantPipeline(new CdcProperties(new CdcProperties.Broker("vm://0","u","p"),List.of(Fixtures.TENANT),null,null,365,500),Fixtures.TENANT,Fixtures.MAPPER);
+        String original=offset().value;
+        assertThat(pipeline.offsetAdvanced(original,original)).isFalse();
+        assertThat(pipeline.offsetAdvanced(original,original.replace("\"event_serial_no\":1","\"event_serial_no\":2"))).isTrue();
+        assertThat(pipeline.offsetAdvanced(original,original.replace("00000027:00000ac0:0003","00000027:00000ac0:0002"))).isFalse();
+        assertThat(pipeline.offsetAdvanced(original,original.replace("00000027:00000ac0:0003","00000027:00000ac0:0004"))).isTrue();
+    }
     SourceActivation activation() { var row=new SourceActivation();row.tenantId="TECHNO";row.configurationHash=TenantStore.configurationHash(Fixtures.TENANT);return row; }
     OffsetRow offset() {
         var row=new OffsetRow();row.key="[\"iqhr-cdc-TECHNO-employee-contract\",{\"server\":\"iqhr-cdc-TECHNO-employee-contract\",\"database\":\"tdev_technophar\"}]";

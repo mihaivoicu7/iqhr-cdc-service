@@ -6,6 +6,16 @@ import com.iqhr.cdc.source.*;
 import java.util.*;
 
 class EventCodecTest {
+    @Test void onboardingFiltersOnlyTheNewTableThroughItsPersistedCommitBoundary() {
+        String boundary="00000027:00000ac0:0003";
+        var expanded=Fixtures.TENANT.withTables(List.of("dbo.HR_EmployeeContractInfo","dbo.HR_EmployeeAllocation"));
+        var codec=new EventCodec(Fixtures.MAPPER,expanded,Fixtures.INCARNATION,Map.of("dbo.HR_EmployeeAllocation",boundary));
+        String value=Fixtures.json("c","null","{}").replace("HR_EmployeeContractInfo","HR_EmployeeAllocation");
+        assertThat(codec.parse("{\"EmployeeID\":1,\"StartDate\":\"2026-01-01\"}",value,"topic")).isNull();
+        assertThat(codec.parse("{\"EmployeeID\":1}",value.replace(boundary,"00000027:00000ac0:0002"),"topic")).isNull();
+        assertThat(codec.parse("{\"EmployeeID\":1}",value.replace(boundary,"00000027:00000ac0:0004"),"topic")).isNotNull();
+        assertThat(codec.parse("{\"EmployeeID\":1}",Fixtures.json("c","null","{}"),"topic")).isNotNull();
+    }
     @Test void compositeKeyAndIdentitySurviveReplayAndFieldOrder() {
         var codec=Fixtures.codec(); var first=Fixtures.event();
         var replay=codec.parse("{\"StartDate\":\"2026-01-01\",\"EmployeeID\":42}",Fixtures.json("c","null","{\"name\":\"A\"}"),"topic");
