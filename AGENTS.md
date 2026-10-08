@@ -1,5 +1,13 @@
 # AGENTS.md instructions for iqhr-cdc-service
 
+## Production deployment approval
+
+- Before a production rollout involving more than one application, ask the user whether each named application should be deployed and wait for explicit approval of the exact rollout scope. An earlier explicit approval of those applications for this rollout satisfies this requirement; a generic request such as "deploy next version" does not authorize adding another application.
+- Prepare and verify the release first, then present the application names, versions, material changes, and production migrations or shared-service changes before asking. Do not begin the production rollout while approval is pending.
+- Count applications by product/service, not by repository or container: the backend and frontend of the same application count as one; separate applications count separately even when they share a repository, build, library, configuration, or deployment script.
+- Shared code, dependencies, compatibility requirements, accumulated changes, and convenience never authorize deploying additional applications. If another application must also change, explain why and obtain approval before deploying it. If the approved scope expands, obtain approval for the expanded scope.
+- A rollout involving only one application may proceed under the user's existing deployment authorization without this additional confirmation. Verification alone never authorizes a production deployment.
+
 ## CDC contracts
 
 - This is a standalone multi-tenant CDC service. Each source tenant database owns its history, activation, checkpoint and schema state.
