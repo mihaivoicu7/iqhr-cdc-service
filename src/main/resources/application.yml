@@ -21,6 +21,7 @@ cdc:
   retry-delay: 10s
   history-retention-days: 365
   retention-batch-size: 500
+  auto-refresh-capture-schema: true
 # Connect/engine diagnostics can embed event values or connection configuration.
 # Our own diagnostics expose fixed codes and exception class names only.
 logging:

@@ -103,35 +103,79 @@ public final class SqlServerControl implements AutoCloseable {
     /** SQL Server-owned catalog metadata cannot be represented by application table entities. */
     public synchronized List<TableObservation> observeTables() throws SQLException {
         assertOwnership();
-        Map<String,List<CaptureObservation>> grouped=new TreeMap<>();
+        Map<String,List<Capture>> grouped=new TreeMap<>();
+        Map<String,List<String>> descriptors=new HashMap<>();
+        Map<String,Integer> sources=new HashMap<>();
         Map<String,String> names=new HashMap<>();
-        try(PreparedStatement statement=query("SELECT s.name,t.name,ct.capture_instance,ct.object_id,ct.source_object_id,ct.create_date,ct.start_lsn FROM cdc.change_tables ct JOIN sys.tables t ON t.object_id=ct.source_object_id JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE t.is_ms_shipped=0");ResultSet rows=statement.executeQuery()) {
+        try(PreparedStatement statement=query("SELECT s.name,t.name,ct.capture_instance,ct.object_id,ct.source_object_id,ct.create_date,ct.start_lsn,ct.role_name,ct.filegroup_name,ct.supports_net_changes,ct.index_name FROM cdc.change_tables ct JOIN sys.tables t ON t.object_id=ct.source_object_id JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE t.is_ms_shipped=0");ResultSet rows=statement.executeQuery()) {
             while(rows.next()) {
                 String schema=rows.getString(1),table=rows.getString(2);
                 if(table.toLowerCase(Locale.ROOT).contains("iqhr_cdc")||"cdc".equalsIgnoreCase(schema))continue;
                 String name=schema+"."+table;
                 int captureId=rows.getInt(4),sourceId=rows.getInt(5);
-                String descriptor=sourceId+"|"+captureId+"|"+rows.getString(3)+"|"+rows.getTimestamp(6).toLocalDateTime()
-                        +"|"+columnShape(sourceId)+"|"+columnShape(captureId)+"|"+keyShape(sourceId);
-                boolean keyed=hasCapturedKey(sourceId,captureId);
-                byte[] minimum=rows.getBytes(7);
-                grouped.computeIfAbsent(name,ignored -> new ArrayList<>()).add(new CaptureObservation(rows.getString(3),descriptor,minimum,keyed));
-                names.put(name,schema);
+                LocalDateTime created=rows.getTimestamp(6).toLocalDateTime();
+                descriptors.computeIfAbsent(name,ignored -> new ArrayList<>()).add(sourceId+"|"+captureId+"|"+rows.getString(3)+"|"+created
+                        +"|"+columnShape(sourceId)+"|"+columnShape(captureId)+"|"+keyShape(sourceId));
+                // start_lsn is the instance's low watermark: set at creation and advanced by CDC cleanup.
+                byte[] start=rows.getBytes(7);
+                grouped.computeIfAbsent(name,ignored -> new ArrayList<>()).add(new Capture(rows.getString(3),created,start,
+                        hasCapturedKey(sourceId,captureId),rows.getString(8),rows.getString(9),
+                        rows.getBoolean(10),rows.getString(11),columns(captureId,true)));
+                sources.put(name,sourceId);names.put(name,schema);
             }
         }
         List<TableObservation> result=new ArrayList<>();
         for(var item:grouped.entrySet()) {
             String name=item.getKey(),schema=names.get(name),table=name.substring(schema.length()+1);
-            List<CaptureObservation> captures=item.getValue();
+            List<Capture> captures=item.getValue().stream().sorted(Comparator.comparing(Capture::createdAt).thenComparing(Capture::name)).toList();
             boolean supported=name.matches("[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*");
-            boolean ready=captures.stream().allMatch(c -> validMinimum(c.minimum()));
-            boolean keyed=captures.stream().allMatch(CaptureObservation::keyed);
-            String fingerprint=TenantStore.sha256(String.join("\n",captures.stream().map(CaptureObservation::descriptor).sorted().toList()));
+            // During a capture refresh the new instance may still be initializing; one ready keyed instance keeps the table readable.
+            boolean ready=captures.stream().anyMatch(Capture::ready);
+            boolean keyed=captures.stream().filter(Capture::ready).allMatch(Capture::keyed)&&captures.stream().anyMatch(Capture::keyed);
+            String fingerprint=TenantStore.sha256(String.join("\n",descriptors.get(name).stream().sorted().toList()));
             result.add(new TableObservation(schema,table,fingerprint,supported&&ready&&keyed,
                     !supported?"TABLE_IDENTIFIER_UNSUPPORTED":!keyed?"CAPTURED_PRIMARY_KEY_REQUIRED":!ready?"CDC_CAPTURE_INITIALIZING":null,
-                    captures.stream().map(CaptureObservation::minimum).filter(Objects::nonNull).toList()));
+                    captures.stream().filter(Capture::ready).map(Capture::start).toList(),captures,columns(sources.get(name),false)));
         }
         return List.copyOf(result);
+    }
+    private List<Column> columns(int objectId,boolean changeTable) throws SQLException {
+        List<Column> result=new ArrayList<>();
+        // Computed columns are never captured by SQL Server CDC, so they are not part of the capturable shape.
+        try(PreparedStatement statement=query("SELECT name,TYPE_NAME(system_type_id),max_length,precision,scale,is_nullable,is_computed FROM sys.columns WHERE object_id=? ORDER BY column_id")) {
+            statement.setInt(1,objectId);
+            try(ResultSet rows=statement.executeQuery()) {
+                while(rows.next()) {
+                    String name=rows.getString(1);
+                    if((changeTable&&name.startsWith("__$"))||rows.getBoolean(7))continue;
+                    String type=rows.getString(2).toLowerCase(Locale.ROOT);
+                    int length=rows.getInt(3);
+                    if(length>0&&(type.equals("nvarchar")||type.equals("nchar")))length/=2;
+                    result.add(new Column(name,type,length,rows.getInt(4),rows.getInt(5),rows.getBoolean(6)));
+                }
+            }
+        }
+        return List.copyOf(result);
+    }
+    /** Creates an additional capture instance; Debezium switches to it at its start LSN without a gap. */
+    public synchronized void createCaptureInstance(String schema,String table,Capture template,String captureInstance) throws SQLException {
+        assertOwnership();
+        try(PreparedStatement statement=query("EXEC sys.sp_cdc_enable_table @source_schema=?,@source_name=?,@role_name=?,@capture_instance=?,@supports_net_changes=?,@index_name=?,@filegroup_name=?")) {
+            statement.setQueryTimeout(120);
+            statement.setString(1,schema);statement.setString(2,table);statement.setString(3,template.role());
+            statement.setString(4,captureInstance);statement.setBoolean(5,template.netChanges());
+            statement.setString(6,template.index());statement.setString(7,template.filegroup());
+            statement.execute();
+        }
+    }
+    /** Retires a superseded capture instance once the saved position is past its replacement's start. */
+    public synchronized void dropCaptureInstance(String schema,String table,String captureInstance) throws SQLException {
+        assertOwnership();
+        try(PreparedStatement statement=query("EXEC sys.sp_cdc_disable_table @source_schema=?,@source_name=?,@capture_instance=?")) {
+            statement.setQueryTimeout(120);
+            statement.setString(1,schema);statement.setString(2,table);statement.setString(3,captureInstance);
+            statement.execute();
+        }
     }
     private String columnShape(int objectId) throws SQLException {
         StringBuilder shape=new StringBuilder();
@@ -193,9 +237,17 @@ public final class SqlServerControl implements AutoCloseable {
         }
         return true;
     }
-    private static boolean validMinimum(byte[] value) {return value!=null&&value.length==10&&!Arrays.equals(value,new byte[10]);}
-    private record CaptureObservation(String name,String descriptor,byte[] minimum,boolean keyed) {}
-    public record TableObservation(String schema,String table,String fingerprint,boolean eligible,String diagnostic,List<byte[]> minimums) {
+    static boolean validMinimum(byte[] value) {return value!=null&&value.length==10&&!Arrays.equals(value,new byte[10]);}
+    public record Column(String name,String type,int length,int precision,int scale,boolean nullable) {}
+    public record Capture(String name,LocalDateTime createdAt,byte[] start,boolean keyed,String role,String filegroup,
+                          boolean netChanges,String index,List<Column> columns) {
+        public boolean ready() {return validMinimum(start);}
+    }
+    public record TableObservation(String schema,String table,String fingerprint,boolean eligible,String diagnostic,List<byte[]> minimums,
+                                   List<Capture> captures,List<Column> sourceColumns) {
+        public TableObservation(String schema,String table,String fingerprint,boolean eligible,String diagnostic,List<byte[]> minimums) {
+            this(schema,table,fingerprint,eligible,diagnostic,minimums,List.of(),List.of());
+        }
         public String qualifiedName() {return schema+"."+table;}
         public boolean coversStart(String saved) {
             byte[] lsn=parseLsn(saved);
@@ -206,7 +258,7 @@ public final class SqlServerControl implements AutoCloseable {
         if(lsn==null||!lsn.matches("[0-9a-fA-F]{8}:[0-9a-fA-F]{8}:[0-9a-fA-F]{4}"))throw new ContinuityException("INVALID_SOURCE_POSITION");
         return HexFormat.of().parseHex(lsn.replace(":",""));
     }
-    private static int compare(byte[] first,byte[] second) { return Arrays.compareUnsigned(first,second); }
+    public static int compare(byte[] first,byte[] second) { return Arrays.compareUnsigned(first,second); }
     public static boolean covers(byte[] saved,byte[] minimum,byte[] end,byte[] maximum) {
         return minimum!=null&&maximum!=null&&compare(saved,minimum)>=0&&compare(saved,maximum)<=0&&(end==null||compare(saved,end)<=0);
     }

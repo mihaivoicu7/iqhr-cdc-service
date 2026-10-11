@@ -61,6 +61,16 @@ public class TenantStore implements AutoCloseable {
     }
     public boolean hasHistory() { return transaction(em -> !em.createQuery("select e.eventId from HistoryEvent e",String.class).setMaxResults(1).getResultList().isEmpty()); }
     public boolean hasSchemaHistory() { return transaction(em -> !em.createQuery("select e.sequence from SchemaHistoryRow e",Long.class).setMaxResults(1).getResultList().isEmpty()); }
+    /** Reassembled Debezium schema-history records in storage order (read-only; Debezium owns the writes). */
+    public List<String> schemaHistory() {
+        return transaction(em -> {
+            Map<String,List<SchemaHistoryRow>> records=new LinkedHashMap<>();
+            for(SchemaHistoryRow row:em.createQuery("from SchemaHistoryRow r order by r.sequence",SchemaHistoryRow.class).getResultList())
+                records.computeIfAbsent(row.recordId==null?"#"+row.sequence:row.recordId,ignored -> new ArrayList<>()).add(row);
+            return records.values().stream().map(parts -> parts.stream().sorted(Comparator.comparingInt(part -> part.part))
+                    .map(part -> part.data==null?"":part.data).reduce("",String::concat)).toList();
+        });
+    }
     public List<OffsetRow> offsets() { return transaction(em -> em.createQuery("from OffsetRow",OffsetRow.class).getResultList()); }
     public SourceActivation claim() {
         return claim(tenant);

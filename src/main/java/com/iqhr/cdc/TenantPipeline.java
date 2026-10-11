@@ -54,7 +54,13 @@ public final class TenantPipeline implements AutoCloseable {
                 String savedLsn=RecoveryGuard.savedLsn(previous,store.offsets(),tenant,mapper);
                 if(previous!=null&&!store.hasSchemaHistory())throw new ContinuityException("SCHEMA_HISTORY_MISSING");
                 if(previous==null&&(store.hasHistory()||store.hasSchemaHistory()))throw new ContinuityException("ACTIVATION_STATE_INCONSISTENT");
-                registry.observe(observed,savedLsn,0);registry.assertActiveContinuity();
+                registry.observe(observed,savedLsn,0);
+                if(previous==null)registry.assertActiveContinuity();
+                else if(registry.suspendUnavailable(tenant,previous.fence,savedLsn)) {
+                    // One table without history must not stop the others: it leaves the configuration, the rest resume.
+                    tenant=registry.effectiveTenant();previous=store.activation();
+                    savedLsn=RecoveryGuard.savedLsn(previous,store.offsets(),tenant,mapper);
+                }
                 // A stopped-reader request is enrolled at its existing checkpoint before any engine can advance it.
                 if(previous!=null&&tryOnboard(store,control,registry,observed,previous.fence)) {
                     tenant=registry.effectiveTenant();previous=store.activation();
@@ -70,7 +76,11 @@ public final class TenantPipeline implements AutoCloseable {
                     // captureAndConsume has joined both workers and flushed confirmed offsets before returning.
                     observed=control.observeTables();
                     savedLsn=RecoveryGuard.savedLsn(activation,store.offsets(),tenant,mapper);
-                    registry.observe(observed,savedLsn,fence);registry.assertActiveContinuity();
+                    registry.observe(observed,savedLsn,fence);
+                    if(registry.suspendUnavailable(tenant,fence,savedLsn)) {
+                        tenant=registry.effectiveTenant();fence=store.activation().fence;
+                        savedLsn=RecoveryGuard.savedLsn(store.activation(),store.offsets(),tenant,mapper);
+                    }
                     tryOnboard(store,control,registry,observed,fence);
                 }
             } catch(Exception e) {
@@ -160,12 +170,17 @@ public final class TenantPipeline implements AutoCloseable {
                         throw e;
                     }
                     List<SqlServerControl.TableObservation> observed=control.observeTables();
-                    registry.observe(observed,savedLsn,activation.fence);registry.assertActiveContinuity();
+                    registry.observe(observed,savedLsn,activation.fence);
+                    // Lost history, disabled CDC or an Admin stop: restart the reader without that table only.
+                    if(registry.hasUnavailableActive()) {reconfigure=true;break;}
+                    evolveSchemas(store,control,registry,observed,savedLsn,activation.fence);
                     SqlServerControl.Diagnostics info=control.inspect(savedLsn,tenant.capturedTables());
                     String currentOffset=store.offsets().getFirst().value;
                     if(offsetAdvanced(startingOffset,currentOffset))registry.confirmedProgress(activation.fence,savedLsn);
                     long queued=broker.verifyQueue();
                     String warning=info.warning();
+                    if(warning==null&&registry.hasUnacknowledgedSuspension())warning="TABLE_CAPTURE_SUSPENDED";
+                    if(warning==null&&registry.hasFailedRefresh())warning="CAPTURE_SCHEMA_REFRESH_FAILED";
                     if(Duration.between(progress.get(),Instant.now()).compareTo(Duration.ofMinutes(2))>0)warning="CAPTURE_PROGRESS_STALE";
                     if(queued>100000)warning="BROKER_BACKLOG_HIGH";
                     String failure=consumerFailure.get();
@@ -192,6 +207,30 @@ public final class TenantPipeline implements AutoCloseable {
             }
         }
         return reconfigure;
+    }
+    /** Online schema evolution: add a refreshed capture instance, or retire the one the reader has left behind. */
+    void evolveSchemas(TenantStore store,SqlServerControl control,TableRegistry registry,
+                       List<SqlServerControl.TableObservation> observed,String savedLsn,long fence) {
+        var reader=SchemaEvolution.readerSchemas(store.schemaHistory(),mapper,tenant.database());
+        for(SchemaEvolution.Action action:registry.planSchemaEvolution(observed,reader,savedLsn,fence,settings.autoRefreshCaptureSchema(),mapper)) {
+            try {
+                switch(action) {
+                    case SchemaEvolution.Create create -> control.createCaptureInstance(create.schema(),create.table(),create.template(),create.captureInstance());
+                    case SchemaEvolution.Retire retire -> control.dropCaptureInstance(retire.schema(),retire.table(),retire.captureInstance());
+                }
+                registry.schemaActionCompleted(action,fence);
+                LOG.info("CDC tenant={} schema action={} table={}.{}",tenant.id(),action.getClass().getSimpleName(),action.schema(),action.table());
+            } catch(java.sql.SQLException e) {
+                String failure=permissionDenied(e)?"CDC_MANAGEMENT_PERMISSION_REQUIRED":"CAPTURE_REFRESH_SQLCODE_"+e.getErrorCode();
+                registry.schemaActionFailed(action,fence,failure);
+                LOG.warn("CDC tenant={} schema action={} table={}.{} code={}",tenant.id(),action.getClass().getSimpleName(),action.schema(),action.table(),failure);
+            }
+        }
+    }
+    /** sp_cdc_enable_table/disable_table require db_owner; SQL Server reports 22902 or a permission error. */
+    static boolean permissionDenied(java.sql.SQLException e) {
+        int code=e.getErrorCode();
+        return code==22902||code==229||code==297||code==15247||code==916;
     }
     boolean offsetAdvanced(String previous,String current) {
         if(previous==null)return current!=null;

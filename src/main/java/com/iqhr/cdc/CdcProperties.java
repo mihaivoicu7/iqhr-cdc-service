@@ -6,19 +6,24 @@ import java.util.List;
 import java.util.Set;
 import java.util.regex.Pattern;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
 
 @ConfigurationProperties("cdc")
 public record CdcProperties(Broker broker, List<Tenant> tenants, Duration monitorInterval,
-                            Duration retryDelay, int historyRetentionDays, int retentionBatchSize) {
+                            Duration retryDelay, int historyRetentionDays, int retentionBatchSize,
+                            Boolean autoRefreshCaptureSchema) {
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9_-]{1,64}");
     public static final String HEARTBEAT_TABLE="dbo.IQHR_CdcHeartbeat";
+    @ConstructorBinding
     public CdcProperties {
         tenants = tenants == null ? List.of() : List.copyOf(tenants);
         monitorInterval = monitorInterval == null ? Duration.ofSeconds(30) : monitorInterval;
         retryDelay = retryDelay == null ? Duration.ofSeconds(10) : retryDelay;
         historyRetentionDays = historyRetentionDays == 0 ? 365 : historyRetentionDays;
         retentionBatchSize = retentionBatchSize == 0 ? 500 : retentionBatchSize;
+        // Schema changes are absorbed by replacing the capture instance; disabling leaves them to an Admin request.
+        autoRefreshCaptureSchema = autoRefreshCaptureSchema == null || autoRefreshCaptureSchema;
         if (monitorInterval.compareTo(Duration.ofSeconds(5)) < 0 || monitorInterval.compareTo(Duration.ofSeconds(30)) > 0 || retryDelay.isNegative()
                 || retryDelay.isZero() || historyRetentionDays != 365 || retentionBatchSize < 1 || retentionBatchSize > 2000)
             throw new IllegalArgumentException("Invalid CDC timing or retention configuration");
@@ -29,6 +34,10 @@ public record CdcProperties(Broker broker, List<Tenant> tenants, Duration monito
                 throw new IllegalArgumentException("Each tenant and physical database must have one configured pipeline");
         }
         if (!tenants.isEmpty() && broker == null) throw new IllegalArgumentException("Broker configuration required");
+    }
+    public CdcProperties(Broker broker, List<Tenant> tenants, Duration monitorInterval, Duration retryDelay,
+                         int historyRetentionDays, int retentionBatchSize) {
+        this(broker, tenants, monitorInterval, retryDelay, historyRetentionDays, retentionBatchSize, null);
     }
     public record Broker(String url, String user, String password) {
         public Broker {

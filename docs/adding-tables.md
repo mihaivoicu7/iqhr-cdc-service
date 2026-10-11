@@ -53,3 +53,9 @@ Deployed service image `iqhr/iqhr-cdc-service:tables-20260922` and Admin backend
 * Final checks: Admin health `UP`; durable history queue had one consumer and zero queued/in-flight messages. CDC used about 270 MiB of its 1 GiB limit at idle. These point-in-time measurements are not a seven-day outage or capacity-soak proof.
 
 First-ever source initialization interrupted before its first complete durable offset deliberately remains fail-closed and needs reviewed recovery. Established sources resume normally from their durable state; expired source retention or lost SQL/broker storage cannot be recovered without appropriate backups.
+
+## Schema evolution and per-table isolation rollout (2026-10-11)
+
+HR Manager migration `V20261001_01` widened five `HR_EmployeeAddress` columns in place. The previous release compared a full capture fingerprint, blocked the table with `CAPTURE_GENERATION_CHANGED` and, through it, stopped the whole TECHNO reader from 2026-10-01 15:10 (no source changes were pending, so nothing was lost; five newly requested tables waited in `PENDING`).
+
+Release `schema-evolution-20261011` (migration V5, see `integration-contract.md`) was deployed on TEST. On start the reader proved coverage for the address table and resumed; the five pending tables onboarded. The reader schema still had `Floor varchar(10)`/`Apartment varchar(5)` against `varchar(20)` in the change table, so the service created `dbo_HR_EmployeeAddress_20261011115708` (11:57:09Z), Debezium recorded the `ALTER` with the new lengths, and the original `dbo_HR_EmployeeAddress` instance was retired at 11:59:23Z. All ten tables are `ACTIVE`/`CURRENT`. A parse-only check validated V5 before deployment and a dry run on live metadata confirmed that only the address table differed. The remaining degraded status is the pre-existing `CDC_JOB_STATE_METRICS_UNAVAILABLE` (msdb permission).

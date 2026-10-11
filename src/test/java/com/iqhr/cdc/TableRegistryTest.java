@@ -108,29 +108,78 @@ class TableRegistryTest {
             assertThat(after.requestedBy).isEqualTo("concurrent-admin");assertThat(after.requestedAt).isNotNull();assertThat(after.version).isGreaterThan(oldVersion);
         }
     }
-    @Test void missingOrReplacedCaptureIsVisibleAndNeverAcceptedAsAHealthyNewGeneration() {
+    static final CdcProperties.Tenant TWO_TABLES=Fixtures.TENANT.withTables(List.of("dbo.HR_EmployeeContractInfo",NEW_NAME));
+    /** Both inventory tables active under one claimed activation, as on TECHNO. */
+    static TableRegistry twoActive(TenantStore store) {
+        store.claim(TWO_TABLES);var registry=new TableRegistry(store,TWO_TABLES);registry.initialize(inventory());return registry;
+    }
+    @Test void replacedCaptureThatStillCoversTheCheckpointKeepsCapturing() {
         try(var store=store(database(),"create-only")) {
             var owner=store.claim();var registry=new TableRegistry(store,Fixtures.TENANT);registry.initialize(inventory());registry.observe(inventory(),SAVED,owner.fence);
-            registry.observe(List.of(observed(NEW_TABLE,"new-generation",MIN)),SAVED,owner.fence);
-            assertThat(row(store,"HR_EmployeeContractInfo").state).isEqualTo("MISSING");
-            assertThatThrownBy(registry::assertActiveContinuity).hasMessage("SOURCE_TABLE_NOT_CDC_ENABLED");
+            registry.confirmedProgress(owner.fence,"00000027:00000af0:0004");
+            assertThat(row(store,"HR_EmployeeContractInfo").state).isEqualTo("ACTIVE");
+            // A schema migration or a capture refresh changes the generation, but the saved position is still readable.
             registry.observe(List.of(observed("HR_EmployeeContractInfo","replacement-generation",MIN)),SAVED,owner.fence);
             var changed=row(store,"HR_EmployeeContractInfo");
-            assertThat(changed.state).isEqualTo("BLOCKED");assertThat(changed.captureFingerprint).isEqualTo("original-generation");
-            assertThatThrownBy(registry::assertActiveContinuity).hasMessage("CAPTURE_GENERATION_CHANGED");
-            registry.observe(inventory(),SAVED,owner.fence);
-            assertThat(row(store,"HR_EmployeeContractInfo").state).isEqualTo("BLOCKED");
+            assertThat(changed.state).isEqualTo("ACTIVE");assertThat(changed.captureFingerprint).isEqualTo("replacement-generation");
+            assertThat(registry.hasUnavailableActive()).isFalse();
         }
     }
-    @Test void retentionGapIsLatchedAndPendingFutureMinimumWaits() {
+    @Test void legacyBlockedGenerationIsReleasedWhenContinuityIsProven() {
+        try(var store=store(database(),"create-only")) {
+            var owner=store.claim();var registry=new TableRegistry(store,Fixtures.TENANT);registry.initialize(inventory());
+            store.transaction(em -> {CdcTable row=em.find(CdcTable.class,TableRegistry.id(Fixtures.TENANT,"dbo","HR_EmployeeContractInfo"));
+                row.state="BLOCKED";row.diagnostic="CAPTURE_GENERATION_CHANGED";return null;});
+            registry.observe(inventory(),SAVED,owner.fence);
+            assertThat(row(store,"HR_EmployeeContractInfo").state).isEqualTo("ONBOARDING");
+            assertThat(registry.hasUnavailableActive()).isFalse();
+        }
+    }
+    @Test void historyGapSuspendsOnlyThatTableAndKeepsTheOthersConfigured() {
+        try(var store=store(database(),"create-only")) {
+            var registry=twoActive(store);long fence=store.activation().fence;
+            var gap=List.of(observed("HR_EmployeeContractInfo","original-generation",MIN),observed(NEW_TABLE,"new-generation","00000028:00000000:0001"));
+            registry.observe(gap,SAVED,fence);
+            assertThat(row(store,NEW_TABLE).state).isEqualTo("BLOCKED");assertThat(row(store,NEW_TABLE).diagnostic).isEqualTo("CAPTURE_HISTORY_GAP");
+            assertThat(registry.hasUnavailableActive()).isTrue();
+            assertThatThrownBy(() -> registry.suspendUnavailable(TWO_TABLES,fence+1,SAVED)).hasMessage("SOURCE_FENCED");
+            assertThat(registry.suspendUnavailable(TWO_TABLES,fence,SAVED)).isTrue();
+            var suspended=row(store,NEW_TABLE);
+            assertThat(suspended.active).isFalse();assertThat(suspended.desiredEnabled).isFalse();
+            assertThat(suspended.suspensionReason).isEqualTo("CAPTURE_HISTORY_GAP");assertThat(suspended.suspendedLsn).isEqualTo(SAVED);
+            var remaining=registry.effectiveTenant();
+            assertThat(remaining.tables()).containsExactly("dbo.HR_EmployeeContractInfo");
+            assertThat(store.activation().configurationHash).isEqualTo(TenantStore.configurationHash(remaining));
+            assertThat(store.activation().fence).isEqualTo(fence+1);
+            assertThat(registry.hasUnacknowledgedSuspension()).isTrue();
+            // The suspended table is selectable again; an Admin request after the suspension acknowledges it.
+            registry.observe(gap,SAVED,fence+1);
+            assertThat(row(store,NEW_TABLE).state).isEqualTo("DISCOVERED");
+            store.transaction(em -> {em.find(CdcTable.class,TableRegistry.id(Fixtures.TENANT,"dbo",NEW_TABLE)).requestedAt=Instant.now().plusSeconds(1);return null;});
+            registry.planSchemaEvolution(gap,Map.of(),SAVED,fence+1,true,Fixtures.MAPPER);
+            assertThat(registry.hasUnacknowledgedSuspension()).isFalse();
+        }
+    }
+    @Test void missingTableAndAdminStopLeaveTheReaderWithoutThatTableOnly() {
+        try(var store=store(database(),"create-only")) {
+            var registry=twoActive(store);long fence=store.activation().fence;
+            registry.observe(List.of(observed("HR_EmployeeContractInfo","original-generation",MIN)),SAVED,fence);
+            assertThat(row(store,NEW_TABLE).state).isEqualTo("MISSING");
+            assertThat(registry.suspendUnavailable(TWO_TABLES,fence,SAVED)).isTrue();
+            assertThat(row(store,NEW_TABLE).suspensionReason).isEqualTo("SOURCE_TABLE_NOT_CDC_ENABLED");
+            // Stopping the last captured table would leave nothing to read; that is a visible source error.
+            store.transaction(em -> {em.find(CdcTable.class,TableRegistry.id(Fixtures.TENANT,"dbo","HR_EmployeeContractInfo")).desiredEnabled=false;return null;});
+            registry.observe(inventory(),SAVED,fence+1);
+            assertThat(row(store,"HR_EmployeeContractInfo").state).isEqualTo("STOPPING");
+            assertThatThrownBy(() -> registry.suspendUnavailable(Fixtures.TENANT,fence+1,SAVED)).hasMessage("ALL_CAPTURED_TABLES_UNAVAILABLE");
+        }
+    }
+    @Test void pendingFutureMinimumWaitsForASafeBoundary() {
         try(var store=store(database(),"create-only")) {
             var owner=store.claim();var registry=new TableRegistry(store,Fixtures.TENANT);registry.initialize(inventory());registry.observe(inventory(),SAVED,owner.fence);request(store);
             var future=List.of(observed("HR_EmployeeContractInfo","original-generation",MIN),observed(NEW_TABLE,"new-generation","00000028:00000000:0001"));
             registry.observe(future,SAVED,owner.fence);
             assertThat(registry.readyRequests(future,SAVED)).isEmpty();assertThat(row(store,NEW_TABLE).state).isEqualTo("PENDING");
-            registry.observe(List.of(observed("HR_EmployeeContractInfo","original-generation","00000028:00000000:0001")),SAVED,owner.fence);
-            assertThatThrownBy(registry::assertActiveContinuity).hasMessage("SOURCE_POSITION_UNAVAILABLE");
-            registry.observe(inventory(),SAVED,owner.fence);assertThat(row(store,"HR_EmployeeContractInfo").state).isEqualTo("BLOCKED");
         }
     }
     @Test void staleCheckpointOrOwnerCannotCommitOnboarding() {
